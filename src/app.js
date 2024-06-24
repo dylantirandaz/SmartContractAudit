@@ -5,9 +5,10 @@ import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Alert, AlertTitle, AlertDescription } from "@/components/ui/alert";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Dialog, DialogTrigger, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
+import { Dialog, DialogTrigger, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Loader2, AlertTriangle, CheckCircle2, Info, Download, Save, Upload } from "lucide-react";
+import { toast } from "@/components/ui/use-toast";
 
 const vulnerabilityInfo = {
   "Reentrancy": {
@@ -15,7 +16,6 @@ const vulnerabilityInfo = {
     mitigation: "Use the checks-effects-interactions pattern or a reentrancy guard.",
     link: "https://consensys.github.io/smart-contract-best-practices/attacks/reentrancy/"
   },
-  // Add more vulnerability types here...
 };
 
 const App = () => {
@@ -28,6 +28,9 @@ const App = () => {
   const [snippets, setSnippets] = useState([]);
   const [newSnippetName, setNewSnippetName] = useState('');
   const [selectedResults, setSelectedResults] = useState([]);
+  const [exportLoading, setExportLoading] = useState(false);
+  const [exportConfirmOpen, setExportConfirmOpen] = useState(false);
+  const [exportFormat, setExportFormat] = useState(null);
 
   useEffect(() => {
     fetchHistory();
@@ -35,23 +38,83 @@ const App = () => {
   }, []);
 
   const fetchHistory = async () => {
-    // Simulated history fetch
-    setHistory([
-      { id: 1, created_at: new Date().toISOString(), vulnerabilities: [{ name: "Reentrancy", description: "Potential reentrancy vulnerability detected" }] },
-      { id: 2, created_at: new Date(Date.now() - 86400000).toISOString(), vulnerabilities: [] }
-    ]);
+    try {
+      const response = await fetch('http://localhost:5000/history', {
+        headers: {
+          'Authorization': `Bearer ${localStorage.getItem('token')}`
+        }
+      });
+      if (response.ok) {
+        const data = await response.json();
+        setHistory(data);
+      } else {
+        throw new Error('Failed to fetch history');
+      }
+    } catch (error) {
+      toast({
+        title: "Error",
+        description: "Failed to fetch analysis history. Please try again.",
+        variant: "destructive",
+      });
+    }
   };
 
   const analyzeContract = async () => {
     setLoading(true);
-    // Simulated contract analysis
-    setTimeout(() => {
-      setResults({
-        vulnerabilities: [
-          { name: "Reentrancy", description: "Potential reentrancy vulnerability detected in function X" }
-        ]
+    try {
+      const response = await fetch('http://localhost:5000/analyze', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${localStorage.getItem('token')}`
+        },
+        body: JSON.stringify({ code, language }),
       });
-      setLoading(false);
+      if (!response.ok) {
+        throw new Error('Network response was not ok');
+      }
+      const data = await response.json();
+      if (data.task_id) {
+        await pollResult(data.task_id);
+      } else {
+        setResults(data);
+      }
+    } catch (error) {
+      toast({
+        title: "Error",
+        description: "An error occurred during analysis. Please try again.",
+        variant: "destructive",
+      });
+    }
+    setLoading(false);
+  };
+
+  const pollResult = async (taskId) => {
+    const pollInterval = setInterval(async () => {
+      try {
+        const response = await fetch(`http://localhost:5000/result/${taskId}`, {
+          headers: {
+            'Authorization': `Bearer ${localStorage.getItem('token')}`
+          }
+        });
+        if (response.ok) {
+          const data = await response.json();
+          if (data.state !== 'PENDING') {
+            clearInterval(pollInterval);
+            setResults(data.result);
+            fetchHistory();
+          }
+        } else {
+          throw new Error('Failed to fetch result');
+        }
+      } catch (error) {
+        clearInterval(pollInterval);
+        toast({
+          title: "Error",
+          description: "Failed to retrieve analysis result. Please try again.",
+          variant: "destructive",
+        });
+      }
     }, 2000);
   };
 
@@ -59,15 +122,20 @@ const App = () => {
     if (newSnippetName && code) {
       const newSnippets = [...snippets, { name: newSnippetName, code, language }];
       setSnippets(newSnippets);
+      localStorage.setItem('codeSnippets', JSON.stringify(newSnippets));
       setNewSnippetName('');
+      toast({
+        title: "Success",
+        description: "Code snippet saved successfully.",
+      });
     }
   };
 
   const loadSnippets = () => {
-    // Simulated snippet loading
-    setSnippets([
-      { name: "Example Contract", code: "contract Example { }", language: "solidity" }
-    ]);
+    const savedSnippets = localStorage.getItem('codeSnippets');
+    if (savedSnippets) {
+      setSnippets(JSON.parse(savedSnippets));
+    }
   };
 
   const loadSnippet = (snippet) => {
@@ -75,10 +143,60 @@ const App = () => {
     setLanguage(snippet.language);
   };
 
-  const exportResults = (format) => {
-    // Simulated export functionality
-    console.log(`Exporting results in ${format} format`);
-    // In a real application, this would generate and download a file
+  const escapeCSV = (str) => {
+    if (typeof str !== 'string') return str;
+    if (str.includes('"') || str.includes(',') || str.includes('\n') || str.includes('\r')) {
+      return '"' + str.replace(/"/g, '""') + '"';
+    }
+    return str;
+  };
+
+  const exportResults = async (format) => {
+    setExportLoading(true);
+    try {
+      if (!results || !results.vulnerabilities) {
+        throw new Error('No results to export');
+      }
+
+      let content = '';
+      let fileName = '';
+      let mimeType = '';
+
+      if (format === 'csv') {
+        content = 'Vulnerability,Description\n';
+        content += results.vulnerabilities.map(v => `${escapeCSV(v.name)},${escapeCSV(v.description)}`).join('\n');
+        fileName = 'vulnerabilities.csv';
+        mimeType = 'text/csv;charset=utf-8;';
+      } else if (format === 'json') {
+        content = JSON.stringify(results, null, 2);
+        fileName = 'vulnerabilities.json';
+        mimeType = 'application/json;charset=utf-8;';
+      } else {
+        throw new Error('Unsupported export format');
+      }
+
+      const blob = new Blob([content], { type: mimeType });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.setAttribute('href', url);
+      link.setAttribute('download', fileName);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+
+      toast({
+        title: "Success",
+        description: `Results exported successfully as ${format.toUpperCase()}.`,
+      });
+    } catch (error) {
+      toast({
+        title: "Error",
+        description: `Failed to export results: ${error.message}`,
+        variant: "destructive",
+      });
+    }
+    setExportLoading(false);
+    setExportConfirmOpen(false);
   };
 
   const renderVulnerability = (vuln, index) => (
@@ -201,14 +319,52 @@ const App = () => {
                     <>
                       {results.vulnerabilities.map((vuln, index) => renderVulnerability(vuln, index))}
                       <div className="flex justify-end space-x-2 mt-4">
-                        <Button onClick={() => exportResults('csv')}>
-                          <Download className="mr-2 h-4 w-4" />
-                          Export CSV
-                        </Button>
-                        <Button onClick={() => exportResults('pdf')}>
-                          <Download className="mr-2 h-4 w-4" />
-                          Export PDF
-                        </Button>
+                        <Dialog open={exportConfirmOpen} onOpenChange={setExportConfirmOpen}>
+                          <DialogTrigger asChild>
+                            <Button onClick={() => setExportFormat('csv')}>
+                              <Download className="mr-2 h-4 w-4" />
+                              Export CSV
+                            </Button>
+                          </DialogTrigger>
+                          <DialogContent>
+                            <DialogHeader>
+                              <DialogTitle>Confirm Export</DialogTitle>
+                              <DialogDescription>
+                                Are you sure you want to export the results as CSV? This file may contain sensitive information.
+                              </DialogDescription>
+                            </DialogHeader>
+                            <DialogFooter>
+                              <Button variant="outline" onClick={() => setExportConfirmOpen(false)}>Cancel</Button>
+                              <Button onClick={() => exportResults('csv')} disabled={exportLoading}>
+                                {exportLoading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                                Confirm Export
+                              </Button>
+                            </DialogFooter>
+                          </DialogContent>
+                        </Dialog>
+                        <Dialog open={exportConfirmOpen} onOpenChange={setExportConfirmOpen}>
+                          <DialogTrigger asChild>
+                            <Button onClick={() => setExportFormat('json')}>
+                              <Download className="mr-2 h-4 w-4" />
+                              Export JSON
+                            </Button>
+                          </DialogTrigger>
+                          <DialogContent>
+                            <DialogHeader>
+                              <DialogTitle>Confirm Export</DialogTitle>
+                              <DialogDescription>
+                                Are you sure you want to export the results as JSON? This file may contain sensitive information.
+                              </DialogDescription>
+                            </DialogHeader>
+                            <DialogFooter>
+                              <Button variant="outline" onClick={() => setExportConfirmOpen(false)}>Cancel</Button>
+                              <Button onClick={() => exportResults('json')} disabled={exportLoading}>
+                                {exportLoading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                                Confirm Export
+                              </Button>
+                            </DialogFooter>
+                          </DialogContent>
+                        </Dialog>
                       </div>
                     </>
                   ) : (
@@ -229,6 +385,8 @@ const App = () => {
               </CardHeader>
               <CardContent>
                 {history.map((item, index) => (
+                  <Card key={index} className="
+                  {history.map((item, index) => (
                   <Card key={index} className="mb-4">
                     <CardHeader>
                       <CardTitle className="flex justify-between items-center">
@@ -237,42 +395,88 @@ const App = () => {
                           type="checkbox" 
                           onChange={(e) => {
                             if (e.target.checked) {
-                              setSelectedResults([...selectedResults, item]);
-                            } else {
+                                   } else {
                               setSelectedResults(selectedResults.filter(r => r.id !== item.id));
                             }
                           }}
-                        />
-                      </CardTitle>
+                         </CardTitle>
                     </CardHeader>
                     <CardContent>
                       {item.vulnerabilities.length > 0 ? (
                         item.vulnerabilities.map((vuln, vIndex) => renderVulnerability(vuln, vIndex))
                       ) : (
-                        <Alert variant="default">
-                          <CheckCircle2 className="h-4 w-4" />
+                        <Alert variant                          <CheckCircle2 className="h-4 w-4" />
                           <AlertTitle>No Vulnerabilities Detected</AlertTitle>
                           <AlertDescription>This analysis did not find any vulnerabilities.</AlertDescription>
                         </Alert>
                       )}
-                    </CardContent>
-                  </Card>
+                         </Card>
                 ))}
                 {selectedResults.length > 1 && (
-                  <Button onClick={() => {
-                    // Implement comparison logic here
-                    console.log("Comparing:", selectedResults);
-                  }}>
+                  <Button onClick={compareResults} className="mt-4">
                     Compare Selected Results
                   </Button>
                 )}
               </CardContent>
             </Card>
-          </TabsContent>
-        </Tabs>
+              </Tabs>
       </main>
+      <Dialog open={compareDialogOpen} onOpenChange={setCompareDialogOpen}>
+        <DialogContent className="max-w-4xl">
+          <DialogHeader>
+            <DialogTitle>Comparison Results</DialogTitle>
+          </DialogHeader>
+          <div className="            <table className="w-full">
+              <thead>
+                <tr>
+                  <th className="px-4 py-2">Vulnerability</th>
+                  {selectedResults.map((result, index) => (
+                               ))}
+                </tr>
+              </thead>
+              <tbody>
+                {comparisonResults.map((row, rowIndex) => (
+                  <tr key={rowIndex}>
+                    <td className="border px-4 py-2">{row.vulnera                    {row.results.map((result, colIndex) => (
+                      <td key={colIndex} className="border px-4 py-2">
+                        {result ? '✓' : '✗'}
+                      </td>
+                    ))}
+                  </tr>
+                              </tbody>
+            </table>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
+};
+
+const compareResults = () => {
+  if (selectedResults.length < 2) {
+    toast({
+      title: "Error",
+      desc      variant: "destructive",
+    });
+    return;
+  }
+
+  const allVulnerabilities = new Set();
+  selectedResults.forEach(result => {
+    result.vulnerabilities.forEach(vuln => {
+      allVulnerabil    });
+  });
+
+  const comparisonResults = Array.from(allVulnerabilities).map(vulnName => {
+    return {
+      vulnerability: vulnName,
+      results: selectedResults.map(result => 
+        result.vulnerabilities.some(v => v.      )
+    };
+  });
+
+  setComparisonResults(comparisonResults);
+  setCompareDialogOpen(true);
 };
 
 export default App;
